@@ -9,6 +9,8 @@ except ImportError:
 from calibre_plugins.prince_pdf.config import prefs
 from calibre_plugins.prince_pdf.convert import ConvertDialog
 from calibre_plugins.prince_pdf.log_box import LogDialog
+from calibre.gui2.dialogs.message_box import MessageBox
+
 
 load_translations()
 
@@ -90,48 +92,20 @@ class PrincePDFDialog(QDialog):
         '''
         Update the info on top of the window
         '''
-
         self.db = self.gui.current_db
-        # Get selected rows
         rows = self.gui.library_view.selectionModel().selectedRows()
         if not rows or len(rows) == 0:
             self.info.setText(_('<b>No books selected</b>'))
             self.info.setAlignment(Qt.AlignCenter)
-            self.suggestion.setText(_('Select one single book'))
-            self.selected = None
-            self.convert_to_PDF_button.setEnabled(False)
-        elif len(rows) > 1:
-            self.info.setText(_('<b>Many books selected</b>'))
-            self.info.setAlignment(Qt.AlignCenter)
-            self.suggestion.setText(_('Select one single book'))
+            self.suggestion.setText(_('Select one or more books'))
             self.selected = None
             self.convert_to_PDF_button.setEnabled(False)
         else:
-            # If there is only one selected book, enable conversion
-            # and show list of available formats (formats in prefs are bold)
-            book_id = self.gui.library_view.model().id(rows[0])
-            fmts = self.db.formats(book_id, index_is_id=True)
-            if (fmts):
-                fmts = fmts.split(',')
-            else: 
-                fmts = [_('<i>none</i>')]
-            available = False
-            for i,fmt in enumerate(fmts):
-                fmts[i] = fmt.lower()
-                if fmts[i] in prefs['formats']:
-                    fmts[i] = '<b>%s</b>' % fmts[i]
-                    available = True
-            self.info.setText(_('Available formats: %s') % ', '.join(fmts))
-            self.info.setAlignment(Qt.AlignLeft)
-            # Conversion enabled only if some "preferred" format is found
-            if (available):
-                self.suggestion.setText(_('Ready'))
-                self.selected = book_id
-                self.convert_to_PDF_button.setEnabled(True)
-            else:
-                self.suggestion.setText(_('No preferred format available'))
-                self.selected = None
-                self.convert_to_PDF_button.setEnabled(False)
+            self.info.setText(_('<b>Selected books:</b> %d') % len(rows))
+            self.info.setAlignment(Qt.AlignCenter)
+            self.suggestion.setText(_('Ready'))
+            self.selected = [self.gui.library_view.model().id(row) for row in rows]
+            self.convert_to_PDF_button.setEnabled(True)
 
     def about(self):
         '''
@@ -163,63 +137,65 @@ class PrincePDFDialog(QDialog):
 
     def convert_to_PDF(self):
         '''
-        Unpack and convert the currently selected book to PDF
+        Unpack and convert the currently selected book(s) to PDF
         '''
         from calibre.gui2 import error_dialog
         from calibre.constants import DEBUG
-
-        # Get available formats
-        book_id = self.selected
-        fmts = self.db.formats(book_id, index_is_id=True)
-        fmts = fmts.lower().split(',')
-        # Process only the first format matching the 'formats' configuration option
-        for fmt in prefs['formats']:
-            fmt = fmt.lower()
-            if (not fmt in fmts): continue
+    
+        for book_id in self.selected:
             mi = self.db.get_metadata(book_id, index_is_id=True, get_cover=False)
             pdf_base_file = self.get_filename(book_id, mi)
-
             # This is the actual code:
             if DEBUG: print('===========')
-            # Unpack the book and call the conversion dialog
+            # Check the formats supported by the book
+            fmts = self.db.formats(book_id, index_is_id=True)
+            fmts = fmts.lower().split(',')
+            # Use EPUB as the preferred format for conversion
+            preferred_format = 'epub'
+            if preferred_format in fmts:
+                fmt = preferred_format
+            else:
+                # If EPUB format is not available, choose the first supported format
+                fmt = fmts[0]
+            # Unpack the book and perform conversion
             (opf, oeb) = self.unpack(book_id, fmt)
-            if (opf == None or oeb == None):
-               return error_dialog(self.gui, _('Cannot convert to PDF'), _('Format not supported: %s') % fmt, show=True)
-            convert_dialog = ConvertDialog(mi, fmt, opf, oeb, self.icon)
+            if opf is None or oeb is None:
+                error_dialog(self.gui, _('Cannot convert to PDF'), _('Format not supported: %s') % fmt, show=True)
+                continue
+            convert_dialog = ConvertDialog(mi, fmt, opf, oeb, self.icon) 
             convert_dialog.pdf_file = pdf_base_file
             pdf_file = ''
-            if (convert_dialog.exec_()):
+            if convert_dialog.exec_():
                 pdf_file = convert_dialog.pdf_file
             self.prince_log = convert_dialog.prince_log
             # After the dialog returns, pdf_file has the output file path,
             # and prince_log has the Prince console output
             if DEBUG: print(_('PDF file: %s') % pdf_file)
             # If there is any log, enable the View log button
-            if (self.prince_log):
+            if self.prince_log:
                 self.view_log.show()
                 log_msg = _(' Check the log.')
             else:
                 self.view_log.hide()
                 log_msg = ''
-            # If the conversion failed, pdf_file will be None,
-            if (pdf_file == None):
-                error_dialog(self.gui, _('Could not convert to PDF'), _('The conversion failed.') + log_msg , show=True)
-            # If the user cancelled the dialog, pdf_file will be ''
-            if (pdf_file):
-                # Set the metadata in the PDF and add it or save it
+            # If conversion fails, pdf_file will be None
+            if pdf_file is None:
+                error_dialog(self.gui, _('Could not convert to PDF'), _('The conversion failed.') + log_msg, show=True)
+                continue
+            if pdf_file:
+                # Set metadata in the PDF file
                 try:
                     self.set_pdf_metadata(mi, pdf_file)
                 except:
                     error_dialog(self.gui, _('Could not convert to PDF'), _("Error reading or writing the PDF file:\n%s" % pdf_file), show=True)
-                    return
-                if (prefs['add_book']):
+                    continue
+                if prefs['add_book']:
                     self.add_pdf(book_id, pdf_file, ('pdf' in fmts))
                 else:
                     self.save_pdf(pdf_file, pdf_base_file)
             if DEBUG: print('===========')
-            return
-        # No matching format in the book
-        return error_dialog(self.gui, _('Cannot convert to PDF'), _('No supported format available'), show=True)
+    
+        MessageBox(MessageBox.INFO, _('Conversion completed'), _('Selected books converted to PDF.')).exec_()
 
     def show_log(self):
         '''
